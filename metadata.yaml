@@ -4,3 +4,4 @@ desc: 让你的bot在不同群聊之间说悄悄话。
 version: 0.1.0
 author: ww
 astrbot_version: ">=4.29.1,<4.30"
+repo: https://github.com/ww1579532468/astrbot_plugin_deep_letter
