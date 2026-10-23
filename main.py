@@ -76,7 +76,6 @@ class InternalLetterEvent(AstrMessageEvent):
         message.timestamp = int(time.time())
         super().__init__(text, message, platform_meta, session.session_id)
         self.context_obj = context
-        self.role = "admin"
         self.is_wake = True
         self.is_at_or_wake_command = True
 
