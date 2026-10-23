@@ -1,0 +1,14 @@
+{
+  "letter_count": {
+    "description": "发信次数 / 总次数",
+    "type": "string",
+    "default": "0/0",
+    "hint": "只是个记录，你也可以手动改"
+  },
+  "hide_enabled": {
+    "description": "隐藏模式",
+    "type": "bool",
+    "default": true,
+    "hint": "默认开启，有冲突时自动关闭。"
+  }
+}
