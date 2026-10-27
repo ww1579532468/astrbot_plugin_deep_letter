@@ -3,12 +3,12 @@
     "description": "联系人",
     "type": "dict",
     "default": {},
-    "hint": "别名：UMO。为空时会自动填入"
+    "hint": "别名：UMO。为空时会自动填入一次"
   },
   "counters": {
-    "description": "新发信次数 / 成功发送次数（广播按一次计）",
+    "description": "发信次数 / 发信回信总次数",
     "type": "string",
     "default": "0/0",
-    "hint": "没有任何作用的计数器"
+    "hint": "没有任何作用的计数器，可以改着玩"
   }
 }
