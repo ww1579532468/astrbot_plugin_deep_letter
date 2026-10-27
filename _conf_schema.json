@@ -1,14 +1,14 @@
 {
-  "letter_count": {
-    "description": "发信次数 / 总次数",
+  "contacts": {
+    "description": "联系人",
+    "type": "dict",
+    "default": {},
+    "hint": "别名：UMO。为空时会自动填入"
+  },
+  "counters": {
+    "description": "新发信次数 / 成功发送次数（广播按一次计）",
     "type": "string",
     "default": "0/0",
-    "hint": "只是个记录，你也可以手动改"
-  },
-  "hide_enabled": {
-    "description": "隐藏模式",
-    "type": "bool",
-    "default": true,
-    "hint": "默认开启，有冲突时自动关闭。"
+    "hint": "没有任何作用的计数器"
   }
 }

@@ -1,7 +1,7 @@
 name: astrbot_plugin_deep_letter
 display_name: 小深信箱
-desc: 让你的bot在不同群聊之间说悄悄话。
-version: 0.1.0
+desc: 让你的bot在不同会话之间说悄悄话。
+version: 0.1.1
 author: ww
-astrbot_version: ">=4.29.1,<4.30"
+astrbot_version: ">=4.29.1"
 repo: https://github.com/ww1579532468/astrbot_plugin_deep_letter

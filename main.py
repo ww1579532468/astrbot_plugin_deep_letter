@@ -1,16 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import copy
+import hashlib
 import json
 import re
-import stat
 import time
 import uuid
-from dataclasses import dataclass
+from collections import Counter
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from astrbot.api import llm_tool, logger
+from astrbot.api import logger
 from astrbot.api.event import MessageChain, filter
 from astrbot.api.star import Context, Star, register
 from astrbot.core.message.components import At, Plain
@@ -18,511 +20,541 @@ from astrbot.core.platform.astr_message_event import AstrMessageEvent
 from astrbot.core.platform.astrbot_message import AstrBotMessage, Group, MessageMember
 from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.message_type import MessageType
-from astrbot.core.platform.platform_metadata import PlatformMetadata
 from astrbot.core.workspace import resolve_workspace_root_for_umo
 
-from .runtime import LetterRuntime
-
 PLUGIN_NAME = "astrbot_plugin_deep_letter"
-MAX_ROUNDS = 10
-SEND_COOLDOWN_SECONDS = 60
-LETTER_TTL_SECONDS = 24 * 60 * 60
-BAD_FILENAME_CHARS = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
-ACTIONS = {
-    "send",
-    "broadcast",
-    "reply",
-    "save",
-    "rename",
-    "delete",
-    "read",
-    "list",
-    "silent",
-}
+MAX_LETTERS = 10
+COOLDOWN_MS = 60_000
+TTL_MS = 86_400_000
+BAD_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+SHORT_PREFIX = re.compile(r"^(?:QQ|微信)?(?:群聊|私聊|会话)_")
+SHORT_NAME = re.compile(r"^(?:QQ|微信)?(?:群聊|私聊|会话)_[0-9a-f]{4,64}$")
 
 
-@dataclass(frozen=True)
+@dataclass
+class Contact:
+    umo: str
+    short: str
+    name: str = ""
+    trusted: bool = False
+    discovered: bool = False
+
+    @property
+    def label(self) -> str:
+        return f"{self.name}（{self.short}）" if self.name else self.short
+
+
+@dataclass
 class Letter:
-    letter_id: str
     source: str
     target: str
     content: str
-    round_no: int = 1
-    is_broadcast: bool = False
+    sender_id: str
+    source_label: str
+    target_label: str
 
 
-class InternalLetterEvent(AstrMessageEvent):
-    def __init__(
-        self,
-        context: Context,
-        session: MessageSession,
-        platform_meta: PlatformMetadata,
-        text: str,
-        source_name: str,
-        target_name: str,
-    ) -> None:
-        # 构造内部来信，后续唤醒、模型处理和上下文记录交给 AstrBot 正常管道。
+@dataclass
+class Broadcast:
+    letters: list[Letter] = field(default_factory=list)
+
+
+@dataclass
+class Thread:
+    history: list[Letter] = field(default_factory=list)
+
+
+# 把信件包装成消息，交给对方的正常管道处理。
+class LetterEvent(AstrMessageEvent):
+    def __init__(self, context, session, platform_meta, text, sender_id, target_name):
         message = AstrBotMessage()
         message.type = session.message_type
-        message.self_id = "letter"
+        message.self_id = "deep_letter"
         message.session_id = session.session_id
+        message.message_id = uuid.uuid4().hex
+        message.sender = MessageMember(user_id=sender_id)
         if session.message_type == MessageType.GROUP_MESSAGE:
             message.group = Group(group_id=session.session_id, group_name=target_name)
-        message.message_id = uuid.uuid4().hex
-        message.sender = MessageMember(user_id="astrbot", nickname=source_name)
-        message.message = [At(qq="letter"), Plain(text)]
+            # 群聊需要 At 唤醒；私聊不需要，避免部分平台渲染出空占位。
+            message.message = [At(qq=message.self_id), Plain(text)]
+        else:
+            message.message = [Plain(text)]
         message.message_str = text
         message.raw_message = text
-        message.timestamp = int(time.time())
         super().__init__(text, message, platform_meta, session.session_id)
-        self.context_obj = context
-        self.is_wake = True
-        self.is_at_or_wake_command = True
+        self._context = context
+        self.is_wake = self.is_at_or_wake_command = True
 
     async def send(self, message: MessageChain) -> None:
-        # 通过目标平台的会话发送接口输出普通回复。
         if message is None or not message.chain:
             return
-        if not await self.context_obj.send_message(self.session, message):
-            raise RuntimeError("目标平台未运行")
+        if not await self._context.send_message(self.session, message):
+            raise RuntimeError("目标平台未运行。")
         await super().send(message)
 
-    async def send_streaming(self, generator, use_fallback: bool = False) -> None:
-        # 转发流式回复内容，空消息由发送方法忽略。
+    async def send_streaming(self, generator, use_fallback=False) -> None:
+        # 仅兜底宿主接口；正常信件经工具入队后由 send 单块发出，不走此处。
         async for chain in generator:
             await self.send(chain)
 
 
-@register(PLUGIN_NAME, "ww", "小深信箱", "0.1.0")
+@register(PLUGIN_NAME, "ww", "小深信箱", "0.1.1")
 class DeepLetterPlugin(Star):
-    def __init__(self, context: Context, config: dict | None = None):
+    def __init__(self, context: Context, config=None):
         super().__init__(context)
-        self.config = config or {}
-        counts = re.fullmatch(
-            r"\s*([0-9]+)\s*/\s*([0-9]+)\s*",
-            str(self.config.get("letter_count", "0/0")),
-        )
-        try:
-            if counts is None:
-                raise ValueError("累计次数格式无效")
-            self._send_count, self._total_count = int(counts[1]), int(counts[2])
-        except ValueError:
-            self._send_count = self._total_count = 0
-            logger.warning("信箱累计次数格式无效，使用 0/0；应为非负整数 x/y。")
-        self.config["letter_count"] = f"{self._send_count}/{self._total_count}"
-        # 最新一封用于校验回信方，完整往返记录用于保存；重载后均不保留。
-        self._letters: dict[str, Letter] = {}
-        self._letter_history: dict[str, list[Letter]] = {}
-        # 收发信共用锁，保护编号、往返次数、冷却和累计计数。
+        self.config = config if config is not None else {}
+        self.contacts: dict[str, Contact] = {}
+        self.aliases: dict[str, str] = {}
+        self.threads: dict[str, Thread] = {}
+        self.broadcasts: dict[str, Broadcast] = {}
         self._lock = asyncio.Lock()
-        self._archive_locks: dict[Path, asyncio.Lock] = {}
-        self._target_catalog: dict[str, dict[str, str]] = {}
-        self._last_send_time: float | None = None
+        self._archive_lock = asyncio.Lock()
         self._last_id = 0
-        self._runtime = LetterRuntime(self)
+        self._last_send: dict[str, int] = {}
+        self._dirty = False
+        self._save_task: asyncio.Task | None = None
+
+    # 会话配置与联系人。
+    def _enabled(self, umo: str) -> bool:
+        plugins = self.context.get_config(umo).get("plugin_set", ["*"])
+        return plugins is None or "*" in plugins or PLUGIN_NAME in plugins
+
+    def _show(self, umo: str) -> bool:
+        return bool(
+            self.context.get_config(umo)
+            .get("provider_settings", {})
+            .get("show_tool_use_status", False)
+        )
+
+    def _prefix(self, umo: str) -> str:
+        session = MessageSession.from_str(umo)
+        platform = self.context.get_platform_inst(session.platform_id)
+        kind = platform.meta().name.lower() if platform else ""
+        if not kind:
+            # 插件初始化可能早于平台实例，回退到默认平台配置。
+            kind = next(
+                (
+                    str(item.get("type", "")).lower()
+                    for item in self.context.get_config(None).get("platform", [])
+                    if item.get("id") == session.platform_id
+                ),
+                "",
+            )
+        brand = (
+            "QQ" if kind in {"aiocqhttp", "qq_official", "qq_official_webhook"} else ""
+        )
+        if "wechat" in kind or "weixin" in kind:
+            brand = "微信"
+        category = {
+            MessageType.GROUP_MESSAGE: "群聊",
+            MessageType.FRIEND_MESSAGE: "私聊",
+        }.get(session.message_type, "会话")
+        return brand + category
 
     async def initialize(self) -> None:
-        # 发现可用会话，并启用 Runner 运行适配。
-        try:
-            for conversation in await self.context.get_db().get_conversations():
-                umo = str(conversation.user_id or "")
-                if (
-                    not umo
-                    or umo in self._target_catalog
-                    or not self._config_allows_plugin(umo)
-                ):
-                    continue
-                mapping = self.context.astrbot_config_mgr._load_conf_mapping(umo)
-                self._target_catalog[umo] = {
-                    "alias": str(conversation.title or umo),
-                    "config": str(mapping.get("path", "default")),
-                }
-            from astrbot.core.provider.register import llm_tools
-
-            tool = llm_tools.get_func("deep_letter")
-            if tool:
-                entries = [
-                    f"{item['alias']} -> {umo} (配置: {item['config']})"
-                    for umo, item in sorted(self._target_catalog.items())
-                ]
-                tool.description += "\n当前可用收信会话：" + (
-                    "；".join(entries) or "暂无已记录的会话"
-                )
-        except Exception:
-            logger.exception("信箱发现可用收信会话失败")
-        self._runtime.install()
+        configured = self.config.get("contacts", {})
+        if not isinstance(configured, dict):
+            raise ValueError("contacts 必须是别名到 UMO 的字典。")
+        # 先读取配置联系人，同一会话可以有多个别名。
+        trusted: dict[str, list[str]] = {}
+        for name, umo in configured.items():
+            if not isinstance(name, str) or not name.strip():
+                raise ValueError("联系人名称不能为空。")
+            name = name.strip()
+            MessageSession.from_str(umo)
+            # 短编号前缀保留，格式不对时不能作为普通别名绕过校验。
+            if SHORT_PREFIX.match(name) and not SHORT_NAME.fullmatch(name):
+                raise ValueError("联系人短编号须为会话前缀加4至64位小写十六进制字符。")
+            if SHORT_NAME.fullmatch(name) and not hashlib.sha256(
+                umo.encode()
+            ).hexdigest().startswith(name.rsplit("_", 1)[1]):
+                raise ValueError("联系人短编号与目标会话不匹配。")
+            trusted.setdefault(umo, []).append(name)
+        # 只扫描已开启信箱的会话，优先取非空名称。
+        scanned: dict[str, str] = {}
+        for item in await self.context.get_db().get_conversations():
+            umo = str(item.user_id or "")
+            try:
+                MessageSession.from_str(umo)
+                if self._enabled(umo):
+                    title = str(item.title or "").strip()
+                    if not scanned.get(umo):
+                        scanned[umo] = title
+            except (ValueError, TypeError):
+                continue
+        # 配置名称优先，扫描到的重名不作为别名。
+        names = Counter(
+            name for umo, name in scanned.items() if umo not in trusted and name
+        )
+        claimed = {name for values in trusted.values() for name in values}
+        if sum(len(values) for values in trusted.values()) != len(claimed):
+            raise ValueError("配置联系人名称去除首尾空格后不能重复。")
+        digests = {
+            umo: hashlib.sha256(umo.encode()).hexdigest()
+            for umo in trusted.keys() | scanned.keys()
+        }
+        # 短编号从四位开始，遇到冲突就延长。
+        for umo, digest in sorted(digests.items()):
+            size = 4
+            while any(
+                other != umo and value[:size] == digest[:size]
+                for other, value in digests.items()
+            ):
+                size += 1
+            candidate = scanned.get(umo, "")
+            if (
+                candidate in claimed
+                or names[candidate] != 1
+                or SHORT_NAME.fullmatch(candidate)
+                or umo in candidate
+            ):
+                candidate = ""
+            name = trusted[umo][0] if umo in trusted else candidate
+            if SHORT_NAME.fullmatch(name):
+                name = ""
+            contact = Contact(
+                umo,
+                f"{self._prefix(umo)}_{digest[:size]}",
+                name,
+                umo in trusted,
+                umo in scanned,
+            )
+            self.contacts[umo] = contact
+            for alias in [
+                contact.short,
+                *trusted.get(umo, []),
+                *([candidate] if candidate and umo not in trusted else []),
+            ]:
+                self.aliases[alias] = umo
+        # 完整展示标签也可作为收信别名。
+        for contact in self.contacts.values():
+            self.aliases.setdefault(contact.label, contact.umo)
+        # 空配置首次填入扫描结果；重名或无名称的会话使用短编号。
+        if not configured and self.contacts:
+            self.config["contacts"] = {
+                contact.name or contact.short: contact.umo
+                for contact in self.contacts.values()
+            }
+            for contact in self.contacts.values():
+                contact.trusted = True
+            self._dirty = True
+            await self._flush_config()
 
     async def terminate(self) -> None:
-        # 卸载插件时撤销进程内的 Runner 适配。
-        self._runtime.uninstall()
+        if self._save_task:
+            await self._save_task
 
+    # 为每次请求单独生成工具描述。
     @filter.on_llm_request()
-    async def describe_runtime_mode(self, event, req) -> None:
-        # 向当前模型请求补充实际运行能力，不修改历史对话。
+    async def append_tool_description(self, event, req) -> None:
         tools = getattr(req, "func_tool", None)
-        if tools is None or tools.get_tool("deep_letter") is None:
+        tool = tools.get_tool("deep_letter") if tools else None
+        if tool is None:
             return
-        self._runtime.check()
-        if self._runtime.active:
-            mode = "隐藏模式：调用和结果提示在群聊中隐藏；满足单工具、成功、无追加消息等条件时可直接结束，不会有下一次对话。"
-        else:
-            mode = (
-                "原生模式：信箱工具调用和结果会在群聊中显示。"
-                "推荐只使用 send 发信。收到信件后直接在当前群聊用正文简要说明。"
+        show = self._show(event.unified_msg_origin)
+        lines = [
+            "[小深信箱] 当前会话工具调用显示开启，忽略基础描述中的自主使用建议。仅在用户明确要求时发信或广播；收到来信后不自主回信，按需向当前会话汇报。"
+            if show
+            else "[小深信箱] 当前会话调用工具显示未开启，可以主动向其他会话中的自己发信。成功默认返回 None 结束本次处理，需要继续时设 continue_chat=true。",
+            "会话：",
+        ]
+        # 配置联系人置顶，按情况追加状态标记。
+        for contact in sorted(self.contacts.values(), key=lambda c: not c.trusted):
+            flags = []
+            if contact.trusted:
+                flags.append("已配置")
+            if self._show(contact.umo):
+                flags.append("显示")
+            if contact.trusted and not contact.discovered:
+                flags.append("未发现")
+            lines.append(
+                "- " + contact.label + ("：" + " ".join(flags) if flags else "")
             )
-        req.system_prompt = (
-            (req.system_prompt or "") + "\n[小深信箱当前运行状态] " + mode
-        )
+        # 仅复制本次请求的工具集合和目标工具，避免会话之间串描述。
+        local_tools = copy.copy(tools)
+        local_tools.tools = list(tools.tools)
+        local_tool = copy.copy(tool)
+        base = tool.description.split("\n[小深信箱]", 1)[0]
+        local_tool.description = base + "\n" + "\n".join(lines)
+        local_tools.add_tool(local_tool)
+        req.func_tool = local_tools
 
-    def _config_allows_plugin(self, umo: str) -> bool:
+    # 后台保存计数，不阻塞发信。
+    async def _flush_config(self) -> None:
+        while self._dirty:
+            self._dirty = False
+            try:
+                save_async = getattr(self.config, "save_config_async", None)
+                if save_async:
+                    await save_async()
+                else:
+                    save = getattr(self.config, "save_config", None)
+                    if save:
+                        await asyncio.to_thread(save)
+            except Exception:
+                logger.error("信箱配置保存失败，当前内存配置保留；不会重新发送。")
+
+    def _count(self, new: bool) -> None:
         try:
-            plugins = self.context.astrbot_config_mgr.get_conf(umo).get(
-                "plugin_set", ["*"]
-            )
-            return (
-                not isinstance(plugins, list)
-                or "*" in plugins
-                or PLUGIN_NAME in plugins
-            )
-        except Exception:
-            logger.exception("信箱读取目标会话配置失败")
-            return False
+            left, right = str(self.config.get("counters", "0/0")).split("/")
+            left, right = int(left), int(right)
+        except (ValueError, TypeError):
+            left, right = 0, 0
+        self.config["counters"] = f"{left + int(new)}/{right + 1}"
+        self._dirty = True
+        if self._save_task is None or self._save_task.done():
+            self._save_task = asyncio.create_task(self._flush_config())
 
-    def _target(self, recipient: str) -> str:
-        recipient = str(recipient or "").strip()
-        if recipient not in self._target_catalog:
-            matches = [
-                umo
-                for umo, item in self._target_catalog.items()
-                if item["alias"] == recipient
-            ]
-            if len(matches) > 1:
-                raise ValueError("收信方别名不唯一，请使用完整 UMO。")
-            if matches:
-                recipient = matches[0]
-        if not recipient:
-            raise ValueError("需要提供收信方 recipient。")
-        MessageSession.from_str(recipient)
-        if not self._config_allows_plugin(recipient):
-            raise ValueError("目标会话未启用信件插件。")
-        return recipient
+    # 内存往返、冷却和消息入队。
+    def _label(self, umo: str) -> str:
+        contact = self.contacts.get(umo)
+        return contact.label if contact else "当前会话"
 
-    def _session_name(self, umo: str) -> str:
-        return self._target_catalog.get(umo, {}).get("alias", umo)
+    def _clean(self) -> None:
+        cutoff = time.time_ns() // 1_000_000 - TTL_MS
+        for records in (self.threads, self.broadcasts):
+            for key in list(records):
+                if int(key) <= cutoff:
+                    del records[key]
 
-    def _expire_letters(self) -> None:
-        # 发新信或广播时按首次编号清理过期内存记录，回信不续期，磁盘存档不受影响。
-        cutoff = time.time_ns() // 1_000_000 - LETTER_TTL_SECONDS * 1000
-        for key in list(self._letters):
-            if int(key) <= cutoff:
-                self._letters.pop(key, None)
-                self._letter_history.pop(key, None)
+    def _cooldown(self, source: str) -> None:
+        remaining = COOLDOWN_MS - (
+            time.time_ns() // 1_000_000 - self._last_send.get(source, 0)
+        )
+        if remaining > 0:
+            raise ValueError(f"发信冷却中，请 {(remaining + 999) // 1000} 秒后再发。")
 
-    async def _enqueue(self, letter: Letter) -> None:
+    def _new_id(self) -> str:
+        self._last_id = max(time.time_ns() // 1_000_000, self._last_id + 1)
+        return str(self._last_id)
+
+    def _enqueue(self, letter: Letter, key: str, number: int, broadcast=False) -> None:
+        if not self._enabled(letter.target):
+            raise ValueError("目标会话未启用信箱。")
         session = MessageSession.from_str(letter.target)
         platform = self.context.get_platform_inst(session.platform_id)
         if platform is None:
             raise ValueError("目标平台未运行。")
-        source_name = self._session_name(letter.source)
-        target_name = self._session_name(letter.target)
+        marker = "1/1 广播" if broadcast else f"{number}/{MAX_LETTERS}"
         text = (
-            f"[来自其他群聊的信件：{source_name} → {target_name}]\n"
-            f"编号：{letter.letter_id} 次数：{letter.round_no}/{MAX_ROUNDS}\n"
-            + (
-                "[广播信：无需回信]隐藏模式调用 silent 结束，原生模式用正文简单输出"
-                if letter.is_broadcast
-                else ""
-            )
-            + f"{letter.content}"
+            f"[来自其他会话的信件：{letter.source_label} → {letter.target_label}]"
+            + f"\n编号：{key} 次数：{marker}\n{letter.content}"
         )
-        event = InternalLetterEvent(
-            self.context, session, platform.meta(), text, source_name, target_name
+        incoming = LetterEvent(
+            self.context,
+            session,
+            platform.meta(),
+            text,
+            letter.sender_id,
+            letter.target_label,
         )
-        # 入队成功不代表对方已处理；此处不经 QQ 接口发送信件。
-        self.context.get_event_queue().put_nowait(event)
+        try:
+            self.context.get_event_queue().put_nowait(incoming)
+        except Exception:
+            raise ValueError("信件入队失败。") from None
+
+    def _letter(self, event, target: str, content: str) -> Letter:
+        source = event.unified_msg_origin
+        return Letter(
+            source,
+            target,
+            content,
+            str(event.get_sender_id() or ""),
+            self._label(source),
+            self._label(target),
+        )
+
+    def _deliver(self, event, target: str, content: str, key: str = "") -> dict:
+        if event.unified_msg_origin == target:
+            raise ValueError("不能向当前会话自己发信。")
+        key = key or self._new_id()
+        thread = self.threads.get(key) or Thread()
+        letter = self._letter(event, target, content)
+        number = len(thread.history) + 1
+        # 入队和登记之间没有 await，失败时不留下记录。
+        self._enqueue(letter, key, number)
+        thread.history.append(letter)
+        self.threads[key] = thread
+        return {"id": key, "n": number}
 
     async def _communicate(
         self,
-        source: str,
+        event: AstrMessageEvent,
         action: str,
         recipient: str,
-        letter_id: str,
+        key: str,
         content: str,
-        *,
-        _skip_cooldown: bool = False,
     ) -> dict:
-        # 在调用方持有通信锁时校验信件并加入事件队列。
-        # _skip_cooldown 仅供同一锁内已检查冷却的广播使用。
-        text = str(content or "").strip()
-        if not text:
-            raise ValueError("信件正文不能为空。")
-        if action == "send":
-            if not _skip_cooldown:
-                self._expire_letters()
-            target = self._target(recipient)
-            if target == source:
-                raise ValueError("不能向当前会话自己发信，请选择其他收信方。")
-            now = time.monotonic()
-            if not _skip_cooldown and self._last_send_time is not None:
-                remaining = SEND_COOLDOWN_SECONDS - (now - self._last_send_time)
-                if remaining > 0:
+        async with self._lock:
+            source = event.unified_msg_origin
+            # 只有新信和广播检查冷却、清理过期记录。
+            if action in {"send", "broadcast"}:
+                self._clean()
+                self._cooldown(source)
+            if action == "send":
+                target = self.aliases.get(recipient)
+                if target is None:
                     raise ValueError(
-                        f"全局发信冷却中，请 {int(remaining) + 1} 秒后再发。"
+                        "找不到收信别名，请使用联系人列表中的名称或短编号。"
                     )
-            # 毫秒时间戳作为整段往返的固定编号，同一毫秒内也保证不重复。
-            self._last_id = max(time.time_ns() // 1_000_000, self._last_id + 1)
-            letter = Letter(
-                str(self._last_id), source, target, text, is_broadcast=_skip_cooldown
-            )
-        else:
-            original = self._letters.get(str(letter_id).strip())
-            if original is None:
-                raise ValueError("找不到该信件；未存档的通信状态在重载后不保留。")
-            if original.target != source:
-                raise ValueError("当前会话不是该信件的收信方。")
-            if original.round_no >= MAX_ROUNDS:
-                raise ValueError("该信件已达到 10 封上限。")
-            target = original.source
-            if not self._config_allows_plugin(target):
-                raise ValueError("目标会话未启用信件插件。")
-            letter = Letter(
-                original.letter_id,
-                source,
-                target,
-                text,
-                original.round_no + 1,
-            )
-        # 先登记最新状态，入队失败则回滚，避免留下未发送的信件。
-        previous = self._letters.get(letter.letter_id)
-        self._letters[letter.letter_id] = letter
-        try:
-            await self._enqueue(letter)
-        except BaseException:
-            if previous is None:
-                self._letters.pop(letter.letter_id, None)
-            else:
-                self._letters[letter.letter_id] = previous
-            raise
-        self._letter_history.setdefault(letter.letter_id, []).append(letter)
-        if action == "send":
-            self._last_send_time = time.monotonic()
-            self._send_count += 1
-        self._total_count += 1
-        self.config["letter_count"] = f"{self._send_count}/{self._total_count}"
-        # 直接保存计数，不触发插件重载，避免丢失内存中的往返记录。
-        try:
-            save_config = getattr(self.config, "save_config", None)
-            if callable(save_config):
-                save_config()
-        except Exception:
-            # 信件已入队，计数保存失败不能当作发送失败，否则容易重复发信。
-            logger.exception("信件已入队，但累计次数保存失败；当前内存计数保留。")
-        return {
-            "letter_id": letter.letter_id,
-            "round": letter.round_no,
-            "status": "queued",
-            "message": "已入队，尚未确认对方处理。",
-        }
+                result = self._deliver(event, target, content)
+                self._last_send[source] = int(result["id"])
+                self._count(True)
+                return result
+            if action == "reply":
+                if key in self.broadcasts:
+                    raise ValueError("广播不支持回信，请另行发信。")
+                thread = self.threads.get(key)
+                if thread is None:
+                    raise ValueError("找不到该编号的信件。")
+                # 只有最新收信方可以回信。
+                last = thread.history[-1]
+                if last.target != source:
+                    raise ValueError("当前会话不是最新一封信的收信方。")
+                if len(thread.history) >= MAX_LETTERS:
+                    raise ValueError("这封信已经到达上限，不能再回了。")
+                result = self._deliver(event, last.source, content, key)
+                self._count(False)
+                return result
+            targets = [target for target in self.contacts if target != source]
+            if not targets:
+                raise ValueError("没有可广播的其他会话。")
+            key = self._new_id()
+            # 广播按动作消耗一次冷却；全部失败也不自动重试。
+            self._last_send[source] = int(key)
+            record = Broadcast()
+            failed = []
+            for target in targets:
+                letter = self._letter(event, target, content)
+                try:
+                    self._enqueue(letter, key, 1, broadcast=True)
+                    record.letters.append(letter)
+                except ValueError as exc:
+                    failed.append(
+                        {"to": self.contacts[target].short, "error": str(exc)}
+                    )
+            if record.letters:
+                self.broadcasts[key] = record
+                self._count(True)
+            return {
+                "id": key,
+                "queued": len(record.letters),
+                "failed": failed,
+            }
 
-    async def _broadcast(self, source: str, content: str) -> dict:
-        # 在调用方持有通信锁时，向各目标发送独立编号的广播信。
-        self._expire_letters()
-        text = str(content or "").strip()
-        if not text:
-            raise ValueError("信件正文不能为空。")
-        if self._last_send_time is not None:
-            remaining = SEND_COOLDOWN_SECONDS - (
-                time.monotonic() - self._last_send_time
-            )
-            if remaining > 0:
-                raise ValueError(f"全局发信冷却中，请 {int(remaining) + 1} 秒后再发。")
-        targets = set(self._target_catalog)
-        targets.discard(source)
-        targets.discard("")
-        # 广播各目标独立编号；部分成功后不回滚，也不重发整批。
-        queued, skipped, failed = [], [], []
-        for target in sorted(targets):
-            if not self._config_allows_plugin(target):
-                skipped.append({"recipient": target, "reason": "目标未启用信箱"})
-                continue
-            try:
-                result = await self._communicate(
-                    source,
-                    "send",
-                    target,
-                    "",
-                    text,
-                    _skip_cooldown=True,
+    # 保存到参与会话自己的工作区。
+    async def _save(self, source: str, key: str, name: str) -> dict:
+        async with self._archive_lock:
+            broadcast = self.broadcasts.get(key)
+            if broadcast:
+                # 发起方保存全部成功目标，收件方只保存自己的那份。
+                letters = broadcast.letters
+                history = (
+                    list(letters)
+                    if source == letters[0].source
+                    else [letter for letter in letters if letter.target == source]
                 )
-            except Exception as exc:
-                failed.append({"recipient": target, "error": str(exc)})
             else:
-                queued.append({"recipient": target, **result})
-        return {
-            "ok": bool(queued) and not failed,
-            "status": "partial"
-            if queued and failed
-            else "queued"
-            if queued
-            else "failed",
-            "queued": queued,
-            "skipped": skipped,
-            "failed": failed,
-            "message": (
-                "成功仅表示入队。每个目标使用独立编号，可各自保存；广播默认无需回信。"
-                "不要重复广播；部分失败时仅按失败目标决定后续处理。"
-                if queued
-                else "没有信件成功入队，未消耗发信冷却和计数。"
-            ),
-        }
+                thread = self.threads.get(key)
+                history = (
+                    list(thread.history)
+                    if thread
+                    and source
+                    in {
+                        thread.history[0].source,
+                        thread.history[0].target,
+                    }
+                    else []
+                )
+            if not history:
+                raise ValueError("找不到当前会话可存档的信件。")
+            root = await resolve_workspace_root_for_umo(source)
+            if not root.is_dir():
+                raise ValueError("当前会话没有工作区，无法存档。")
+            return await asyncio.to_thread(
+                self._write_archive, root, key, history, name, bool(broadcast)
+            )
 
     @staticmethod
-    def _archive_path(
-        folder: Path, title: str, current: Path | None = None, *, date_prefix: str = ""
-    ) -> Path:
-        # 选择可用的存档文件名，避免覆盖其他存档。
-        title = BAD_FILENAME_CHARS.sub("_", str(title or "").strip()).rstrip(" .")[:80]
-        if not title:
-            raise ValueError("需要提供有效的存档标题。")
-        if current is not None:
-            match = re.match(r"^([0-9]{4}-[0-9]{2}-[0-9]{2})_", current.name)
-            if match is None:
-                raise ValueError("存档文件名缺少日期前缀，无法改名。")
-            prefix = match.group(1)
-        else:
-            if not date_prefix:
-                raise ValueError("新建存档必须提供首次发信日期。")
-            prefix = date_prefix
-        index = 1
-        while True:
-            suffix = "" if index == 1 else f"_{index}"
-            # Linux 按字节限制文件名长度，不能只按字符数量截断。
-            budget = 255 - len(f"{prefix}_{suffix}.md".encode())
-            shortened = title.encode("utf-8")[:budget].decode("utf-8", errors="ignore")
-            path = folder / f"{prefix}_{shortened.rstrip(' .')}{suffix}.md"
-            if path == current or not (path.exists() or path.is_symlink()):
-                return path
-            index += 1
-
-    async def _archive(
-        self,
-        source: str,
-        action: str,
-        letter_id: str,
-        content: str,
-        name: str,
-        new_name: str,
-        recipient: str,
-        month: str = "",
+    def _write_archive(
+        root: Path, key: str, history: list[Letter], name: str, broadcast: bool = False
     ) -> dict:
-        # 在实际存档目录的锁内管理所选月份的文件。
-        selected_month = str(month or "").strip() or datetime.now().strftime("%Y-%m")
-        if not re.fullmatch(
-            r"[0-9]{4}-(0[1-9]|1[0-2])", selected_month
-        ) or selected_month.startswith("0000-"):
-            raise ValueError("month 必须为有效年月 YYYY-MM，例如 2026-10。")
-        root = await resolve_workspace_root_for_umo(source)
-        folder = root / "letters" / selected_month
-        folder = folder.resolve()
-        # 同一实际目录串行操作，独立工作区或月份可以分别处理。
-        lock = self._archive_locks.setdefault(folder, asyncio.Lock())
-        async with lock:
-            folder.mkdir(parents=True, exist_ok=True)
-            if action == "list":
-                result = {
-                    "files": sorted(
-                        p.name
-                        for p in folder.glob("*.md")
-                        if p.is_file() and not p.is_symlink()
-                    )
-                }
-            elif action == "save":
-                if content or new_name or recipient:
-                    raise ValueError(
-                        "save 接受 letter_id 和可选 name，不接受内容、新标题或收信方。"
-                    )
-                key = str(letter_id or "").strip()
-                # 后续没有 await，先复制已入队记录，再同步保存完整往返内容。
-                history = list(self._letter_history.get(key, ()))
-                if not history or source not in {
-                    history[0].source,
-                    history[0].target,
-                }:
-                    raise ValueError(
-                        "缺少当前会话可用的信件编号；重载后通信记录不保留。"
-                    )
-                text = (
-                    f"# 信件 {key}\n\n"
-                    + "\n\n".join(
-                        f"## 第 {item.round_no} 封：{self._session_name(item.source)} → {self._session_name(item.target)}\n\n{item.content}"
-                        for item in history
-                    )
-                    + "\n"
-                )
-                # 按文件首行的原始编号查重，改名后重复保存仍能找到原文件。
-                existing = None
-                for candidate in folder.glob("*.md"):
-                    if candidate.is_symlink() or not candidate.is_file():
-                        continue
-                    try:
-                        with candidate.open(encoding="utf-8") as saved:
-                            if saved.readline().strip() == f"# 信件 {key}":
-                                existing = candidate
-                                break
-                    except UnicodeDecodeError:
-                        continue
-                # 重复保存保留文件名；首次保存的日期取自原编号的时间戳。
-                path = existing or self._archive_path(
-                    folder,
-                    name or f"信件_{key}",
-                    date_prefix=datetime.fromtimestamp(int(key) / 1000).strftime(
-                        "%Y-%m-%d"
-                    ),
-                )
-                temporary = folder / f".{uuid.uuid4().hex}.tmp"
-                try:
-                    with temporary.open("x", encoding="utf-8") as output:
-                        output.write(text)
-                    if existing is not None:
-                        temporary.chmod(stat.S_IMODE(existing.stat().st_mode))
-                    # 临时文件写完再替换，避免中断写入破坏原存档。
-                    temporary.replace(path)
-                finally:
-                    temporary.unlink(missing_ok=True)
-                result = {
-                    "file": path.name,
-                    "letter_id": key,
-                    "letters": len(history),
-                    "status": "saved",
-                }
-            else:
-                filename = str(name or "").strip()
-                if not filename or "/" in filename or "\\" in filename:
-                    raise ValueError("请提供 list 返回的完整文件名。")
-                path = folder / filename
-                if (
-                    path.is_symlink()
-                    or not path.is_file()
-                    or path.suffix.lower() != ".md"
-                ):
-                    raise ValueError("找不到指定月份的信件文件。")
-                if action == "read":
-                    result = {
-                        "file": path.name,
-                        "content": path.read_text(encoding="utf-8"),
-                    }
-                elif action == "delete":
-                    path.unlink()
-                    result = {"file": filename}
-                else:
-                    new_path = self._archive_path(folder, new_name, current=path)
-                    if new_path != path:
-                        path.rename(new_path)
-                    result = {"file": new_path.name}
+        date = datetime.fromtimestamp(int(key) / 1000)
+        folder = root / "letters" / date.strftime("%Y-%m")
+        folder.mkdir(parents=True, exist_ok=True)
+        # 用文件首行编号查找旧存档，重复保存时刷新。
+        existing = None
+        for path in folder.glob("*.txt"):
+            if path.is_symlink() or not path.is_file():
+                continue
+            try:
+                with path.open(encoding="utf-8") as saved:
+                    if saved.readline().strip() == key:
+                        existing = path
+                        break
+            except UnicodeError:
+                continue
+        title = BAD_NAME.sub("_", name.strip()).rstrip(" .")
+        title = title.encode("utf-8")[:160].decode("utf-8", errors="ignore")
+        suffix = f"_{title}" if title else ""
+        path = (
+            existing
+            if existing and not name
+            else folder / (date.strftime("%d-%H-%M-%S") + suffix + ".txt")
+        )
+        if path != existing and (path.exists() or path.is_symlink()):
+            path = folder / (
+                date.strftime("%d-%H-%M-%S")
+                + f"-{int(key) % 1000:03d}"
+                + suffix
+                + ".txt"
+            )
+            if path != existing and (path.exists() or path.is_symlink()):
+                raise ValueError("存档名称冲突，请换一个。")
+        if broadcast:
+            first = history[0]
+            body = f"{first.source_label}→{'、'.join(item.target_label for item in history)}\n{first.content}"
+        else:
+            body = "\n\n".join(
+                f"{item.source_label}→{item.target_label}\n{item.content}"
+                for item in history
+            )
+        text = f"{key}\n{history[0].sender_id}\n\n{body}\n"
+        # 先写好临时内容，再改名并原子刷新，失败时保留旧内容。
+        temporary = folder / f".{uuid.uuid4().hex}.tmp"
+        try:
+            temporary.write_text(text, encoding="utf-8")
+            if existing and existing != path:
+                existing.rename(path)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+        return {"file": str(path.relative_to(root))}
 
-            return result
+    # 统一生成模型可见的精简结果。
+    @staticmethod
+    def _result(
+        action: str, result: dict, show: bool, continue_chat: bool
+    ) -> str | None:
+        if action == "broadcast":
+            output = {"id": result["id"], "queued": result["queued"]}
+            if result["failed"]:
+                output["failed"] = result["failed"]
+        elif action == "save":
+            output = {"file": result["file"]}
+        else:
+            output = {"id": result["id"], "n": result["n"]}
+        if show:
+            output["hint"] = "显示已开启"
+        failed = action == "broadcast" and (
+            not result["queued"] or bool(result["failed"])
+        )
+        if failed or continue_chat or show:
+            return json.dumps(output, ensure_ascii=False, separators=(",", ":"))
+        return None
 
-    @llm_tool(name="deep_letter")
+    # 工具入口只负责参数校验和动作分派。
+    @filter.llm_tool(name="deep_letter")
     async def deep_letter(
         self,
         event: AstrMessageEvent,
@@ -531,94 +563,71 @@ class DeepLetterPlugin(Star):
         letter_id: str = "",
         content: str = "",
         name: str = "",
-        new_name: str = "",
-        silent: bool = True,
-        month: str = "",
-    ) -> str:
-        """小深信箱，当你感觉有值得分享或保存的信息时自主使用，用户在隐藏模式下看不见这些操作。
-
-        send 发信，broadcast 广播。共享冷却60秒，不能发自己。
-        reply 回信，同编号最多10次。需要主动静默结束回信使用silent，收到广播直接使用silent。
-        信件内容建议不超过100字，成功仅表示入队，不保证对方已处理。
-
-        save 按编号保存；name 指定首次标题。
-        list 列出存档，read 读取，rename 改名，delete 删除。
-        month 可选年月 YYYY-MM，默认当月。
-
-        该工具的全部调用默认隐藏，在无后续时调用默认会结束当前对话。
-        需要继续对话时传入silent=false；read/list 始终继续。
-        正文部分会全部发出到聊天界面中，需要静默时不要输出正文只调用工具。
+        continue_chat: bool = False,
+    ) -> str | None:
+        """小深信箱，当你感觉有值得向其他会话中的自己分享、转达或保存的信息时自主使用。
+        send 发信，冷却60秒。reply 回信，原信与回信总计最多10封；不必回信时直接 stop，或者按情况向当前会话汇报。
+        broadcast 广播，仅在用户明确要求时使用，不支持回信。
+        stop 静默结束当前回信，始终返回 None，不受显示开关或 continue_chat 影响。
+        save 按编号存档，依赖当前会话的工作区
+        信件内容建议不超过100字，发送成功只代表入队，不代表对方已处理。
+        调用工具前不要重复输出信件正文。尽量减少自主使用发信的频率。
 
         Args:
-            action(string): send、broadcast、reply、save、read、list、rename、delete 或 silent。
-            recipient(string): send 必填，使用已列出的会话别名或完整 UMO；broadcast/reply 不填。
-            letter_id(string): reply/save 必填，沿用首次发信生成的编号。
-            content(string): send/broadcast/reply 的正文，建议不超过100字；save 不接受。
-            name(string): save 的可选首次标题；read/rename/delete 使用 list 返回的完整文件名。
-            new_name(string): rename 的新标题，不含日期或扩展名。
-            month(string): 存档操作的可选年月 YYYY-MM，默认当月。
-            silent(boolean): 默认 true；确需操作后继续才设 false。read/list/silent 动作忽略此值。
-
-        Returns:
-            JSON 结果，含 ok、action、runtime_mode、auto_end_available 和操作结果或 error。
+            action(string): send、broadcast、reply、save 或 stop；stop 无需其他参数。
+            recipient(string): send 必填，见联系人列表中的名称或短编号。
+            letter_id(string): reply/save 必填，整段往返编号保持不变。
+            content(string): send/broadcast/reply 必填，建议不超过100字。
+            name(string): save 可选，提供时更新存档名称。
+            continue_chat(boolean): 成功后是否继续对话，默认 false，失败或显示开启时自动返回。
         """
-        action = str(action or "").strip().lower()
+        # stop 直接结束，不读取配置或修改任何状态。
+        if action == "stop":
+            return None
         try:
-            source = str(event.unified_msg_origin or "").strip()
+            if action not in {"send", "broadcast", "reply", "save"}:
+                raise ValueError("action 仅支持 send/broadcast/reply/save/stop。")
+            if not isinstance(continue_chat, bool):
+                raise ValueError("continue_chat 必须是布尔值。")
+            if not all(
+                isinstance(value, str)
+                for value in (recipient, letter_id, content, name)
+            ):
+                raise ValueError("联系人、编号、正文与名称必须是字符串。")
+            source = event.unified_msg_origin
             if not source:
                 raise ValueError("无法确定当前会话。")
-            if action not in ACTIONS:
-                raise ValueError(
-                    "action 必须是 send/broadcast/reply/save/rename/delete/read/list/silent。"
-                )
-            if not isinstance(silent, bool):
-                raise ValueError("silent 必须是布尔值。")
-            if month and action not in {"save", "read", "list", "rename", "delete"}:
-                raise ValueError("month 仅用于 save/read/list/rename/delete。")
-            if action not in {"send", "broadcast", "reply"}:
-                logger.info("[%s] 调用信箱工具：%s", self._session_name(source), action)
-            if action == "silent":
-                result = {"status": "silent"}
-            elif action == "broadcast":
-                if any(
-                    str(value or "").strip()
-                    for value in (recipient, letter_id, name, new_name)
-                ):
-                    raise ValueError(
-                        "broadcast 只接受 content 和可选 silent，不填写 recipient、letter_id 或标题。"
-                    )
-                async with self._lock:
-                    result = await self._broadcast(source, content)
-            elif action in {"send", "reply"}:
-                async with self._lock:
-                    result = await self._communicate(
-                        source, action, recipient, letter_id, content
-                    )
-            else:
-                result = await self._archive(
-                    source, action, letter_id, content, name, new_name, recipient, month
-                )
-            self._runtime.check()
-            return json.dumps(
-                {
-                    "ok": True,
-                    "action": action,
-                    **result,
-                    "runtime_mode": "hidden" if self._runtime.active else "native",
-                    "auto_end_available": self._runtime.active,
-                },
-                ensure_ascii=False,
+            recipient, letter_id, content = (
+                recipient.strip(),
+                letter_id.strip(),
+                content.strip(),
             )
-        except asyncio.CancelledError:
-            raise
-        except Exception as exc:
+            if action in {"reply", "save"} and not letter_id:
+                raise ValueError("需要提供信件编号。")
+            # 操作前读取开关，避免入队成功后因读取失败而误报。
+            show = self._show(source)
+            if action == "save":
+                if content or recipient:
+                    raise ValueError("save 只接受编号、可选名称和 continue_chat。")
+                result = await self._save(source, letter_id, name)
+            else:
+                if not content:
+                    raise ValueError("信件正文不能为空。")
+                if (
+                    name
+                    or (action != "send" and recipient)
+                    or (action != "reply" and letter_id)
+                ):
+                    raise ValueError("当前动作包含不适用的参数。")
+                result = await self._communicate(
+                    event, action, recipient, letter_id, content
+                )
+            return self._result(action, result, show, continue_chat)
+        except ValueError as exc:
+            return json.dumps({"error": str(exc)}, ensure_ascii=False)
+        except Exception:
+            logger.error("信箱操作失败，请检查目标平台、工作区或配置。")
             return json.dumps(
-                {
-                    "ok": False,
-                    "action": action,
-                    "error": str(exc),
-                    "runtime_mode": "hidden" if self._runtime.active else "native",
-                    "auto_end_available": self._runtime.active,
-                },
+                {"error": "操作失败，请检查目标平台、工作区或配置。"},
                 ensure_ascii=False,
             )
